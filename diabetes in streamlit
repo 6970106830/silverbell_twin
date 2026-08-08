@@ -1,5 +1,6 @@
 import statistics
 import time
+import sqlite3
 from dataclasses import dataclass, replace
 from typing import Dict, List, Optional
 import streamlit as st
@@ -26,27 +27,53 @@ class PatientRepository:
     """
     Data Access Layer.
 
-    Owns the in-memory 'database' of patients, seeds mock data, and applies
+    Owns the SQLite 'database' of patients, seeds mock data, and applies
     initialization-time cleanup rules (e.g. fixing missing BMI values).
     """
 
-    def __init__(self) -> None:
-        self._patients: Dict[int, Patient] = {}
-        self._seed_mock_data()
-        self._clean_missing_bmi()
+    def __init__(self, db_name: str = "patients.db") -> None:
+        self.db_name = db_name
+        self._conn = None
+        self._connect()
+        self._create_table()
+        # Only seed data if the table is empty (first run)
+        if not self.get_all_ids():
+            self._seed_mock_data()
+            self._clean_missing_bmi()
+
+    def _connect(self) -> None:
+        self._conn = sqlite3.connect(self.db_name, check_same_thread=False) # Allow multiple threads for Streamlit
+        self._conn.row_factory = sqlite3.Row # Access columns by name
+
+    def _create_table(self) -> None:
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS patients (
+                patient_id INTEGER PRIMARY KEY,
+                glucose REAL,
+                bmi REAL,
+                age INTEGER,
+                blood_pressure REAL
+            )
+        """)
+        self._conn.commit()
 
     # -- Seeding -------------------------------------------------------------
     def _seed_mock_data(self) -> None:
-        """Loads 4 sample patients. Patient 3 has a BMI of 0 (missing data)
-        to demonstrate the automatic cleanup routine."""
+        """Loads 4 sample patients into the database."""
         mock_records = [
             Patient(patient_id=1, glucose=95, bmi=22.5, age=28, blood_pressure=115),
             Patient(patient_id=2, glucose=130, bmi=31.0, age=52, blood_pressure=142),
             Patient(patient_id=3, glucose=110, bmi=0.0, age=61, blood_pressure=128),  # BMI missing
             Patient(patient_id=4, glucose=180, bmi=27.8, age=45, blood_pressure=150),
         ]
+        cursor = self._conn.cursor()
         for p in mock_records:
-            self._patients[p.patient_id] = p
+            cursor.execute("""
+                INSERT INTO patients (patient_id, glucose, bmi, age, blood_pressure)
+                VALUES (?, ?, ?, ?, ?)
+            """, (p.patient_id, p.glucose, p.bmi, p.age, p.blood_pressure))
+        self._conn.commit()
 
     # -- Cleanup --------------------------------------------------------------
     def _clean_missing_bmi(self) -> None:
@@ -55,33 +82,69 @@ class PatientRepository:
         data. It is replaced with the median BMI computed from all OTHER
         patients with a valid (non-zero) BMI.
         """
-        valid_bmis = [p.bmi for p in self._patients.values() if p.bmi != 0]
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT bmi FROM patients WHERE bmi != 0")
+        valid_bmis_rows = cursor.fetchall()
+        valid_bmis = [row['bmi'] for row in valid_bmis_rows]
+
         if not valid_bmis:
             return  # No valid BMI values to compute a median from.
 
         median_bmi = statistics.median(valid_bmis)
 
-        for patient_id, patient in self._patients.items():
-            if patient.bmi == 0:
-                self._patients[patient_id] = replace(patient, bmi=median_bmi)
+        cursor.execute("UPDATE patients SET bmi = ? WHERE bmi = 0", (median_bmi,))
+        self._conn.commit()
 
     # -- Public data-access API ------------------------------------------------
     def get_all_ids(self) -> List[int]:
         """Returns a sorted list of all valid patient IDs."""
-        return sorted(self._patients.keys())
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT patient_id FROM patients ORDER BY patient_id")
+        return [row['patient_id'] for row in cursor.fetchall()]
 
     def get_patient(self, patient_id: int) -> Optional[Patient]:
         """Fetches a single patient record by ID, or None if not found."""
-        return self._patients.get(patient_id)
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT * FROM patients WHERE patient_id = ?", (patient_id,))
+        row = cursor.fetchone()
+        if row:
+            return Patient(
+                patient_id=row['patient_id'],
+                glucose=row['glucose'],
+                bmi=row['bmi'],
+                age=row['age'],
+                blood_pressure=row['blood_pressure']
+            )
+        return None
 
     def update_patient(self, patient_id: int, **updated_fields) -> Optional[Patient]:
         """Persists updated metric values for an existing patient."""
-        existing = self._patients.get(patient_id)
-        if existing is None:
+        existing_patient = self.get_patient(patient_id)
+        if existing_patient is None:
             return None
-        updated = replace(existing, **updated_fields)
-        self._patients[patient_id] = updated
-        return updated
+
+        # Build update query dynamically
+        set_clauses = []
+        values = []
+        for field, value in updated_fields.items():
+            set_clauses.append(f"{field} = ?")
+            values.append(value)
+
+        if not set_clauses:
+            return existing_patient # Nothing to update
+
+        values.append(patient_id)
+        query = f"UPDATE patients SET {', '.join(set_clauses)} WHERE patient_id = ?"
+
+        cursor = self._conn.cursor()
+        cursor.execute(query, tuple(values))
+        self._conn.commit()
+        return self.get_patient(patient_id) # Return the updated patient
+
+    def close(self) -> None:
+        """Closes the database connection."""
+        if self._conn:
+            self._conn.close()
 
 
 # ============================================================================
@@ -192,10 +255,13 @@ def main() -> None:
     st.title("Diabetes Risk Scoring System")
     st.markdown("---\n" * 1)
 
-    repository = PatientRepository()
+    # Initialize repository and service, storing repository in session state for persistence
+    if 'repository' not in st.session_state:
+        st.session_state.repository = PatientRepository()
+    repository = st.session_state.repository
     service = RiskScoringService()
 
-    # Initialize session state for storing current patient data
+    # Initialize other session state variables
     if 'current_patient' not in st.session_state:
         st.session_state.current_patient = None
     if 'patient_metrics' not in st.session_state:
@@ -206,31 +272,36 @@ def main() -> None:
     # --- Patient Selection ---
     st.subheader("Patient Selection")
     patient_ids = repository.get_all_ids()
-    selected_patient_id = st.selectbox(
-        "Select a Patient ID:", 
+    # Ensure the selected_patient_id is still valid if the list of patients changes
+    if 'selected_patient_id' not in st.session_state or st.session_state.selected_patient_id not in patient_ids:
+        st.session_state.selected_patient_id = patient_ids[0] if patient_ids else None
+
+    selected_patient_id_display = st.selectbox(
+        "Select a Patient ID:",
         options=patient_ids,
-        index=0 if patient_ids else None,
-        key="select_patient_id"
+        index=patient_ids.index(st.session_state.selected_patient_id) if st.session_state.selected_patient_id in patient_ids else (0 if patient_ids else None),
+        key="select_patient_id_widget"
     )
 
     col1, col2 = st.columns([1, 1])
 
     with col1:
         if st.button("Load Patient Profile", key="load_button"):
-            if selected_patient_id:
-                patient = repository.get_patient(selected_patient_id)
+            if selected_patient_id_display:
+                st.session_state.selected_patient_id = selected_patient_id_display
+                patient = repository.get_patient(st.session_state.selected_patient_id)
                 if patient:
                     st.session_state.current_patient = patient
                     st.session_state.patient_metrics = {
-                        "Glucose": patient.glucose,
-                        "BMI": patient.bmi,
-                        "Age": patient.age,
-                        "BloodPressure": patient.blood_pressure,
+                        "glucose": patient.glucose,
+                        "bmi": patient.bmi,
+                        "age": patient.age,
+                        "blood_pressure": patient.blood_pressure,
                     }
                     st.session_state.report_content = ""
-                    st.success(f"Patient {selected_patient_id} loaded.")
+                    st.success(f"Patient {st.session_state.selected_patient_id} loaded.")
                 else:
-                    st.error(f"Patient ID {selected_patient_id} not found.")
+                    st.error(f"Patient ID {st.session_state.selected_patient_id} not found.")
             else:
                 st.warning("Please select a Patient ID to load.")
 
@@ -239,60 +310,56 @@ def main() -> None:
     if st.session_state.current_patient:
         current_patient_data = st.session_state.current_patient
         st.write(f"**Patient ID: {current_patient_data.patient_id}**")
-        
-        # Use session_state.patient_metrics to pre-fill inputs
-        glucose_val = st.session_state.patient_metrics.get("Glucose", current_patient_data.glucose)
-        bmi_val = st.session_state.patient_metrics.get("BMI", current_patient_data.bmi)
-        age_val = st.session_state.patient_metrics.get("Age", current_patient_data.age)
-        blood_pressure_val = st.session_state.patient_metrics.get("BloodPressure", current_patient_data.blood_pressure)
 
-        st.session_state.patient_metrics["Glucose"] = st.number_input("Glucose (mg/dL)", value=float(glucose_val), key="input_glucose")
-        st.session_state.patient_metrics["BMI"] = st.number_input("BMI", value=float(bmi_val), key="input_bmi")
-        st.session_state.patient_metrics["Age"] = st.number_input("Age (years)", value=int(age_val), key="input_age")
-        st.session_state.patient_metrics["BloodPressure"] = st.number_input("Blood Pressure (mmHg)", value=float(blood_pressure_val), key="input_blood_pressure")
+        # Use session_state.patient_metrics to pre-fill inputs
+        glucose_val = st.session_state.patient_metrics.get("glucose", current_patient_data.glucose)
+        bmi_val = st.session_state.patient_metrics.get("bmi", current_patient_data.bmi)
+        age_val = st.session_state.patient_metrics.get("age", current_patient_data.age)
+        blood_pressure_val = st.session_state.patient_metrics.get("blood_pressure", current_patient_data.blood_pressure)
+
+        st.session_state.patient_metrics["glucose"] = st.number_input("Glucose (mg/dL)", value=float(glucose_val), key="input_glucose")
+        st.session_state.patient_metrics["bmi"] = st.number_input("BMI", value=float(bmi_val), key="input_bmi")
+        st.session_state.patient_metrics["age"] = st.number_input("Age (years)", value=int(age_val), key="input_age")
+        st.session_state.patient_metrics["blood_pressure"] = st.number_input("Blood Pressure (mmHg)", value=float(blood_pressure_val), key="input_blood_pressure")
 
         if st.button("Calculate & Assess Risk", key="assess_button"):
             try:
-                updated_glucose = st.session_state.patient_metrics["Glucose"]
-                updated_bmi = st.session_state.patient_metrics["BMI"]
-                updated_age = st.session_state.patient_metrics["Age"]
-                updated_blood_pressure = st.session_state.patient_metrics["BloodPressure"]
+                updated_glucose = st.session_state.patient_metrics["glucose"]
+                updated_bmi = st.session_state.patient_metrics["bmi"]
+                updated_age = st.session_state.patient_metrics["age"]
+                updated_blood_pressure = st.session_state.patient_metrics["blood_pressure"]
 
-                # Create a temporary Patient object with potentially updated metrics for evaluation
-                patient_for_evaluation = Patient(
-                    patient_id=current_patient_data.patient_id,
-                    glucose=updated_glucose,
-                    bmi=updated_bmi,
-                    age=updated_age,
-                    blood_pressure=updated_blood_pressure
-                )
-
-                # Update the repository's patient data (important for persistence if needed)
-                repository.update_patient(
+                # Update the repository's patient data first
+                updated_patient = repository.update_patient(
                     current_patient_data.patient_id,
                     glucose=updated_glucose,
                     bmi=updated_bmi,
                     age=updated_age,
                     blood_pressure=updated_blood_pressure
                 )
+                
+                if updated_patient:
+                    st.session_state.current_patient = updated_patient # Update current patient in session state
+                    evaluation = service.evaluate(updated_patient)
 
-                evaluation = service.evaluate(patient_for_evaluation)
-
-                border = "*" * 42
-                report_lines = [
-                    f"```markdown",
-                    f"# {border}",
-                    f"#      OFFICIAL MEDICAL DIAGNOSTIC REPORT",
-                    f"# {border}",
-                    f"#  Patient ID:       {patient_for_evaluation.patient_id}",
-                    f"#  Cumulative Score: {evaluation['total_score']} pts",
-                    f"#  Risk Category:    {evaluation['category'].upper()}",
-                    f"# {border}",
-                    f"#  *** CONFIDENTIAL - MEDICAL RECORD *** ",
-                    f"# {border}",
-                    f"```"
-                ]
-                st.session_state.report_content = "\n".join(report_lines)
+                    border = "*" * 42
+                    report_lines = [
+                        f"```markdown",
+                        f"# {border}",
+                        f"#      OFFICIAL MEDICAL DIAGNOSTIC REPORT",
+                        f"# {border}",
+                        f"#  Patient ID:       {updated_patient.patient_id}",
+                        f"#  Cumulative Score: {evaluation['total_score']} pts",
+                        f"#  Risk Category:    {evaluation['category'].upper()}",
+                        f"# {border}",
+                        f"#  *** CONFIDENTIAL - MEDICAL RECORD *** ",
+                        f"# {border}",
+                        f"```"
+                    ]
+                    st.session_state.report_content = "\n".join(report_lines)
+                    st.success("Patient data updated and risk assessed!")
+                else:
+                    st.error(f"Failed to update patient {current_patient_data.patient_id}.")
 
             except ValueError:
                 st.error("Please ensure all metrics are valid numeric values.")
