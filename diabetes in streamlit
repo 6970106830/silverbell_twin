@@ -1,0 +1,310 @@
+import statistics
+import time
+from dataclasses import dataclass, replace
+from typing import Dict, List, Optional
+import streamlit as st
+
+# ============================================================================
+# 1. DATA ACCESS LAYER (THE MODEL)
+# ============================================================================
+# Responsible ONLY for storing/retrieving patient records and performing
+# basic data-integrity cleanup on load. Contains NO clinical decision logic
+# and NO presentation/I/O logic.
+# ============================================================================
+
+@dataclass
+class Patient:
+    """Plain data structure representing a patient's baseline metrics."""
+    patient_id: int
+    glucose: float
+    bmi: float
+    age: int
+    blood_pressure: float
+
+
+class PatientRepository:
+    """
+    Data Access Layer.
+
+    Owns the in-memory 'database' of patients, seeds mock data, and applies
+    initialization-time cleanup rules (e.g. fixing missing BMI values).
+    """
+
+    def __init__(self) -> None:
+        self._patients: Dict[int, Patient] = {}
+        self._seed_mock_data()
+        self._clean_missing_bmi()
+
+    # -- Seeding -------------------------------------------------------------
+    def _seed_mock_data(self) -> None:
+        """Loads 4 sample patients. Patient 3 has a BMI of 0 (missing data)
+        to demonstrate the automatic cleanup routine."""
+        mock_records = [
+            Patient(patient_id=1, glucose=95, bmi=22.5, age=28, blood_pressure=115),
+            Patient(patient_id=2, glucose=130, bmi=31.0, age=52, blood_pressure=142),
+            Patient(patient_id=3, glucose=110, bmi=0.0, age=61, blood_pressure=128),  # BMI missing
+            Patient(patient_id=4, glucose=180, bmi=27.8, age=45, blood_pressure=150),
+        ]
+        for p in mock_records:
+            self._patients[p.patient_id] = p
+
+    # -- Cleanup --------------------------------------------------------------
+    def _clean_missing_bmi(self) -> None:
+        """
+        Data cleanup rule: any patient with BMI == 0 is treated as missing
+        data. It is replaced with the median BMI computed from all OTHER
+        patients with a valid (non-zero) BMI.
+        """
+        valid_bmis = [p.bmi for p in self._patients.values() if p.bmi != 0]
+        if not valid_bmis:
+            return  # No valid BMI values to compute a median from.
+
+        median_bmi = statistics.median(valid_bmis)
+
+        for patient_id, patient in self._patients.items():
+            if patient.bmi == 0:
+                self._patients[patient_id] = replace(patient, bmi=median_bmi)
+
+    # -- Public data-access API ------------------------------------------------
+    def get_all_ids(self) -> List[int]:
+        """Returns a sorted list of all valid patient IDs."""
+        return sorted(self._patients.keys())
+
+    def get_patient(self, patient_id: int) -> Optional[Patient]:
+        """Fetches a single patient record by ID, or None if not found."""
+        return self._patients.get(patient_id)
+
+    def update_patient(self, patient_id: int, **updated_fields) -> Optional[Patient]:
+        """Persists updated metric values for an existing patient."""
+        existing = self._patients.get(patient_id)
+        if existing is None:
+            return None
+        updated = replace(existing, **updated_fields)
+        self._patients[patient_id] = updated
+        return updated
+
+
+# ============================================================================
+# 2. BUSINESS LOGIC LAYER (THE SERVICE)
+# ============================================================================
+# Pure clinical decision rules. No print statements, no input() calls, no
+# knowledge of the repository or the console — just data in, data out.
+# This makes the layer trivially unit-testable.
+# ============================================================================
+
+class RiskScoringService:
+    """
+    Business Logic Layer.
+
+    Encapsulates the clinical scoring rules used to evaluate diabetes risk.
+    Each metric is scored 0 (Low), 1 (Medium), or 2 (High); the four scores
+    are summed into a total risk score which maps to a risk category.
+    """
+
+    # Category score bands
+    LOW_RISK_MAX = 2       # 0-2  => Low Risk
+    MODERATE_RISK_MAX = 5  # 3-5  => Moderate Risk
+    # 6+ => High Risk
+
+    @staticmethod
+    def score_glucose(glucose: float) -> int:
+        """Glucose (mg/dL): <100 Low, 100-125 Medium, >=126 High."""
+        if glucose < 100:
+            return 0
+        elif glucose <= 125:
+            return 1
+        else:
+            return 2
+
+    @staticmethod
+    def score_bmi(bmi: float) -> int:
+        """BMI: <25 Low, 25-29.9 Medium, >=30 High."""
+        if bmi < 25:
+            return 0
+        elif bmi < 30:
+            return 1
+        else:
+            return 2
+
+    @staticmethod
+    def score_age(age: int) -> int:
+        """Age (years): <40 Low, 40-59 Medium, >=60 High."""
+        if age < 40:
+            return 0
+        elif age < 60:
+            return 1
+        else:
+            return 2
+
+    @staticmethod
+    def score_blood_pressure(blood_pressure: float) -> int:
+        """Systolic Blood Pressure (mmHg): <120 Low, 120-139 Medium, >=140 High."""
+        if blood_pressure < 120:
+            return 0
+        elif blood_pressure < 140:
+            return 1
+        else:
+            return 2
+
+    @classmethod
+    def calculate_total_score(cls, patient: Patient) -> int:
+        """Sums the individual metric scores into one total risk score (0-8)."""
+        return (
+            cls.score_glucose(patient.glucose)
+            + cls.score_bmi(patient.bmi)
+            + cls.score_age(patient.age)
+            + cls.score_blood_pressure(patient.blood_pressure)
+        )
+
+    @classmethod
+    def categorize_risk(cls, total_score: int) -> str:
+        """Maps a total score to a human-readable risk category."""
+        if total_score <= cls.LOW_RISK_MAX:
+            return "Low Risk"
+        elif total_score <= cls.MODERATE_RISK_MAX:
+            return "Moderate Risk"
+        else:
+            return "High Risk"
+
+    @classmethod
+    def evaluate(cls, patient: Patient) -> dict:
+        """
+        Runs the full evaluation pipeline for a patient and returns a
+        structured breakdown suitable for reporting.
+        """
+        breakdown = {
+            "Glucose": cls.score_glucose(patient.glucose),
+            "BMI": cls.score_bmi(patient.bmi),
+            "Age": cls.score_age(patient.age),
+            "BloodPressure": cls.score_blood_pressure(patient.blood_pressure),
+        }
+        total = sum(breakdown.values())
+        category = cls.categorize_risk(total)
+        return {"breakdown": breakdown, "total_score": total, "category": category}
+
+
+# ============================================================================
+# APPLICATION ENTRYPOINT for Streamlit
+# ============================================================================
+
+def main() -> None:
+    st.set_page_config(page_title="Diabetes Risk Scoring System", layout="centered")
+    st.title("Diabetes Risk Scoring System")
+    st.markdown("---\n" * 1)
+
+    repository = PatientRepository()
+    service = RiskScoringService()
+
+    # Initialize session state for storing current patient data
+    if 'current_patient' not in st.session_state:
+        st.session_state.current_patient = None
+    if 'patient_metrics' not in st.session_state:
+        st.session_state.patient_metrics = {}
+    if 'report_content' not in st.session_state:
+        st.session_state.report_content = ""
+
+    # --- Patient Selection ---
+    st.subheader("Patient Selection")
+    patient_ids = repository.get_all_ids()
+    selected_patient_id = st.selectbox(
+        "Select a Patient ID:", 
+        options=patient_ids,
+        index=0 if patient_ids else None,
+        key="select_patient_id"
+    )
+
+    col1, col2 = st.columns([1, 1])
+
+    with col1:
+        if st.button("Load Patient Profile", key="load_button"):
+            if selected_patient_id:
+                patient = repository.get_patient(selected_patient_id)
+                if patient:
+                    st.session_state.current_patient = patient
+                    st.session_state.patient_metrics = {
+                        "Glucose": patient.glucose,
+                        "BMI": patient.bmi,
+                        "Age": patient.age,
+                        "BloodPressure": patient.blood_pressure,
+                    }
+                    st.session_state.report_content = ""
+                    st.success(f"Patient {selected_patient_id} loaded.")
+                else:
+                    st.error(f"Patient ID {selected_patient_id} not found.")
+            else:
+                st.warning("Please select a Patient ID to load.")
+
+    # --- Clinical Metrics Input ---
+    st.subheader("Clinical Metrics")
+    if st.session_state.current_patient:
+        current_patient_data = st.session_state.current_patient
+        st.write(f"**Patient ID: {current_patient_data.patient_id}**")
+        
+        # Use session_state.patient_metrics to pre-fill inputs
+        glucose_val = st.session_state.patient_metrics.get("Glucose", current_patient_data.glucose)
+        bmi_val = st.session_state.patient_metrics.get("BMI", current_patient_data.bmi)
+        age_val = st.session_state.patient_metrics.get("Age", current_patient_data.age)
+        blood_pressure_val = st.session_state.patient_metrics.get("BloodPressure", current_patient_data.blood_pressure)
+
+        st.session_state.patient_metrics["Glucose"] = st.number_input("Glucose (mg/dL)", value=float(glucose_val), key="input_glucose")
+        st.session_state.patient_metrics["BMI"] = st.number_input("BMI", value=float(bmi_val), key="input_bmi")
+        st.session_state.patient_metrics["Age"] = st.number_input("Age (years)", value=int(age_val), key="input_age")
+        st.session_state.patient_metrics["BloodPressure"] = st.number_input("Blood Pressure (mmHg)", value=float(blood_pressure_val), key="input_blood_pressure")
+
+        if st.button("Calculate & Assess Risk", key="assess_button"):
+            try:
+                updated_glucose = st.session_state.patient_metrics["Glucose"]
+                updated_bmi = st.session_state.patient_metrics["BMI"]
+                updated_age = st.session_state.patient_metrics["Age"]
+                updated_blood_pressure = st.session_state.patient_metrics["BloodPressure"]
+
+                # Create a temporary Patient object with potentially updated metrics for evaluation
+                patient_for_evaluation = Patient(
+                    patient_id=current_patient_data.patient_id,
+                    glucose=updated_glucose,
+                    bmi=updated_bmi,
+                    age=updated_age,
+                    blood_pressure=updated_blood_pressure
+                )
+
+                # Update the repository's patient data (important for persistence if needed)
+                repository.update_patient(
+                    current_patient_data.patient_id,
+                    glucose=updated_glucose,
+                    bmi=updated_bmi,
+                    age=updated_age,
+                    blood_pressure=updated_blood_pressure
+                )
+
+                evaluation = service.evaluate(patient_for_evaluation)
+
+                border = "*" * 42
+                report_lines = [
+                    f"```markdown",
+                    f"# {border}",
+                    f"#      OFFICIAL MEDICAL DIAGNOSTIC REPORT",
+                    f"# {border}",
+                    f"#  Patient ID:       {patient_for_evaluation.patient_id}",
+                    f"#  Cumulative Score: {evaluation['total_score']} pts",
+                    f"#  Risk Category:    {evaluation['category'].upper()}",
+                    f"# {border}",
+                    f"#  *** CONFIDENTIAL - MEDICAL RECORD *** ",
+                    f"# {border}",
+                    f"```"
+                ]
+                st.session_state.report_content = "\n".join(report_lines)
+
+            except ValueError:
+                st.error("Please ensure all metrics are valid numeric values.")
+
+    else:
+        st.info("Load a patient profile to view and edit clinical metrics.")
+
+    # --- Diagnostic Report ---
+    if st.session_state.report_content:
+        st.subheader("Diagnostic Risk Report")
+        st.markdown(st.session_state.report_content)
+
+
+if __name__ == "__main__":
+    main()
